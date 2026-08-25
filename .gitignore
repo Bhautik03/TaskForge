@@ -1,0 +1,10 @@
+# Compiled object files and binaries
+*.o
+scheduler
+
+# Ignore PDF revision notes and extra documentation files
+docs/
+tests/
+
+# Ignore log contents but keep directory structure
+logs/*.log
