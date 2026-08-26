@@ -1,60 +1,73 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/wait.h>
 #include <time.h>
 #include "process.h"
 
-int process_execute_job_dummy(Job *job)
+pid_t process_spawn_job_async(Job *job)
 {
-    if (!job) return -1;
+    if (!job || job->arg_count == 0 || job->args[0] == NULL) {
+        printf("Error: No command provided for execution.\n");
+        return -1;
+    }
+
+    job->started_at = time(NULL);
 
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("fork failed");
         job->state = JOB_STATE_FAILED;
+        job->completed_at = time(NULL);
+        job->duration = difftime(job->completed_at, job->started_at);
         return -1;
     } 
     else if (pid == 0) {
-        /* Child Process */
-        printf("\n[CHILD  PID %d] (Parent PPID %d) Executing test action for Job ID %d ('%s')...\n",
-               getpid(), getppid(), job->job_id, job->full_command);
+        /* Child Process: Replace memory image with binary */
+        execvp(job->args[0], job->args);
+
+        /* Reached only on execvp failure */
+        fprintf(stderr, "\n[WORKER CHILD PID %d] execvp failed for '%s': %s\n",
+                getpid(), job->args[0], strerror(errno));
         
-        sleep(1); /* Simulate work */
-        
-        printf("[CHILD  PID %d] Test action complete. Exiting child process with status 0.\n\n", getpid());
-        exit(0); /* Terminate child process cleanly */
+        /* POSIX standard exit code 127 for execution failure */
+        exit(127);
     } 
     else {
         /* Parent Process */
         job->pid = pid;
         job->state = JOB_STATE_RUNNING;
-        job->started_at = time(NULL);
+        return pid;
+    }
+}
 
-        printf("\n[PARENT PID %d] Forked child PID %d for Job ID %d. Waiting via waitpid()...\n",
-               getpid(), pid, job->job_id);
+void process_evaluate_exit_status(Job *job, int status)
+{
+    if (!job) return;
 
-        int status = 0;
-        pid_t wpid = waitpid(pid, &status, 0);
+    job->completed_at = time(NULL);
+    job->duration = difftime(job->completed_at, job->started_at);
 
-        if (wpid > 0) {
-            if (WIFEXITED(status)) {
-                job->exit_code = WEXITSTATUS(status);
-                job->state = JOB_STATE_COMPLETED;
-            } else {
-                job->exit_code = -1;
-                job->state = JOB_STATE_FAILED;
-            }
+    if (WIFEXITED(status)) {
+        job->exit_code = WEXITSTATUS(status);
+        job->term_sig = 0;
+        if (job->exit_code == 0) {
+            job->state = JOB_STATE_COMPLETED;
         } else {
-            perror("waitpid failed");
             job->state = JOB_STATE_FAILED;
         }
-
-        job->completed_at = time(NULL);
-
-        printf("[PARENT PID %d] Child PID %d harvested. Job ID %d state updated to %s.\n\n",
-               getpid(), pid, job->job_id, job_state_to_string(job->state));
-        return 0;
+    } 
+    else if (WIFSIGNALED(status)) {
+        job->term_sig = WTERMSIG(status);
+        job->exit_code = 128 + job->term_sig;
+        job->state = JOB_STATE_FAILED;
+    } 
+    else {
+        job->exit_code = -1;
+        job->state = JOB_STATE_FAILED;
     }
 }

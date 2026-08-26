@@ -1,7 +1,10 @@
 #include "worker.h"
 
-/* 
- * Worker Module Skeleton.
- * Implementation will be added in subsequent development phases.
- */
-typedef int iso_c_guard_worker;
+void worker_init(Worker *w, int id)
+{
+    if (!w) return;
+    w->worker_id = id;
+    w->active = 0;
+    w->current_job_id = -1;
+    w->pid = -1;
+}

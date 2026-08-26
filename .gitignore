@@ -2,7 +2,7 @@
 *.o
 scheduler
 
-# Ignore PDF revision notes and extra documentation files
+# Ignore PDF revision notes and markdown documentation files
 docs/
 tests/
 

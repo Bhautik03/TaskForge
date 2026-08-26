@@ -41,31 +41,42 @@ static void handle_submit(Scheduler *sched, char *args)
     trim_whitespace(args);
     if (strlen(args) == 0) {
         printf("Usage: submit <command> [priority]\n");
-        printf("Example: submit sleep 10 5\n\n");
+        printf("Example: submit sleep 5 10\n\n");
         return;
     }
 
-    /* Check if the last token is priority number */
     char cmd_copy[MAX_COMMAND_LEN];
     strncpy(cmd_copy, args, MAX_COMMAND_LEN - 1);
     cmd_copy[MAX_COMMAND_LEN - 1] = '\0';
 
     int priority = 0;
-    char *last_space = strrchr(cmd_copy, ' ');
-    if (last_space != NULL) {
-        char *potential_priority = last_space + 1;
-        if (is_numeric_str(potential_priority)) {
-            priority = atoi(potential_priority);
-            *last_space = '\0'; /* Truncate command to exclude priority token */
-            trim_whitespace(cmd_copy);
-        }
+
+    int token_count = 0;
+    char temp_tok[MAX_COMMAND_LEN];
+    strncpy(temp_tok, args, MAX_COMMAND_LEN - 1);
+    temp_tok[MAX_COMMAND_LEN - 1] = '\0';
+
+    char *tok = strtok(temp_tok, " \t");
+    while (tok != NULL) {
+        token_count++;
+        tok = strtok(NULL, " \t");
     }
 
-    if (strlen(cmd_copy) == 0) {
-        /* Fallback if user submitted only a number */
-        strncpy(cmd_copy, args, MAX_COMMAND_LEN - 1);
-        cmd_copy[MAX_COMMAND_LEN - 1] = '\0';
-        priority = 0;
+    char *last_space = strrchr(cmd_copy, ' ');
+    if (last_space != NULL && token_count >= 2) {
+        char *last_token = last_space + 1;
+        if (is_numeric_str(last_token)) {
+            char first_token[64] = {0};
+            sscanf(cmd_copy, "%63s", first_token);
+
+            if (strcmp(first_token, "sleep") == 0 && token_count == 2) {
+                priority = 0;
+            } else {
+                priority = atoi(last_token);
+                *last_space = '\0';
+                trim_whitespace(cmd_copy);
+            }
+        }
     }
 
     scheduler_submit_job(sched, cmd_copy, priority);
@@ -73,11 +84,12 @@ static void handle_submit(Scheduler *sched, char *args)
 
 static void print_help(void)
 {
-    printf("\nMulti-Process Job Scheduler CLI\n");
+    printf("\nMulti-Process Job Scheduler CLI (MAX_WORKERS = %d)\n", MAX_WORKERS);
     printf("Available Commands:\n");
-    printf("  submit <command> [priority]  Submit a job to the scheduler (e.g. submit sleep 10 5)\n");
-    printf("  jobs                         List all jobs in the job table\n");
-    printf("  status <job_id>              Display detailed status for a job\n");
+    printf("  submit <command> [priority]  Submit a job to the scheduler (e.g. submit sleep 2)\n");
+    printf("  jobs                         List all jobs and active worker slots\n");
+    printf("  status <job_id>              Display detailed status for a specific job\n");
+    printf("  wait                         Wait for all running and queued jobs to complete\n");
     printf("  help                         Display this help menu\n");
     printf("  exit                         Exit the scheduler program\n\n");
 }
@@ -89,12 +101,15 @@ int main(void)
 
     char line[MAX_COMMAND_LEN * 2];
 
-    printf("====================================================\n");
-    printf(" Multi-Process Job Scheduler (Phase 2: CLI & Table) \n");
-    printf(" Type 'help' for available commands or 'exit' to quit.\n");
-    printf("====================================================\n\n");
+    printf("=========================================================\n");
+    printf(" Multi-Process Job Scheduler (Phase 6: %d Workers)       \n", MAX_WORKERS);
+    printf(" Type 'help' for available commands or 'exit' to quit.   \n");
+    printf("=========================================================\n\n");
 
     while (1) {
+        /* Periodically harvest finished workers and dispatch waiting jobs */
+        scheduler_dispatch(&sched);
+
         printf("scheduler> ");
         fflush(stdout);
 
@@ -108,7 +123,6 @@ int main(void)
             continue;
         }
 
-        /* Parse command verb and arguments */
         char command[64] = {0};
         char *args = NULL;
 
@@ -137,6 +151,8 @@ int main(void)
                 int job_id = atoi(args);
                 scheduler_job_status(&sched, job_id);
             }
+        } else if (strcmp(command, "wait") == 0) {
+            scheduler_wait_all(&sched);
         } else if (strcmp(command, "help") == 0) {
             print_help();
         } else if (strcmp(command, "exit") == 0) {

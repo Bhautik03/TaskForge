@@ -15,21 +15,23 @@ typedef enum {
 } JobState;
 
 typedef struct {
-    int job_id;
-    char full_command[MAX_COMMAND_LEN];
-    char args_storage[MAX_ARGS][MAX_COMMAND_LEN];
-    char *args[MAX_ARGS + 1];
-    int arg_count;
-    int priority;
-    JobState state;
-    pid_t pid;
-    int exit_code;
-    time_t created_at;
-    time_t started_at;
-    time_t completed_at;
+    int job_id;                                    /* Unique auto-incrementing integer key */
+    char full_command[MAX_COMMAND_LEN];             /* Raw command string */
+    char args_storage[MAX_ARGS][MAX_COMMAND_LEN];  /* Static argument buffers */
+    char *args[MAX_ARGS + 1];                      /* NULL-terminated pointer vector for execvp */
+    int arg_count;                                 /* Number of arguments */
+    int priority;                                  /* Priority integer level */
+    JobState state;                                /* Lifecycle state enum */
+    pid_t pid;                                     /* Operating system Process ID */
+    int exit_code;                                 /* Exit status code */
+    int term_sig;                                  /* Termination signal number if signaled */
+    time_t created_at;                             /* Submission timestamp */
+    time_t started_at;                             /* Start timestamp */
+    time_t completed_at;                           /* Finish timestamp */
+    double duration;                               /* Execution duration in seconds */
 } Job;
 
-/* Utility function to convert JobState enum to string representation */
-const char* job_state_to_string(JobState state);
+/* Helper to convert JobState enum to readable string */
+const char *job_state_to_string(JobState state);
 
 #endif /* JOB_H */
