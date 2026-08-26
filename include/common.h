@@ -6,4 +6,8 @@
 #define MAX_ARGS 16
 #define MAX_WORKERS 3
 
+#define HIGHEST_PRIORITY 1
+#define LOWEST_PRIORITY 10
+#define DEFAULT_PRIORITY 5
+
 #endif /* COMMON_H */

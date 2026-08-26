@@ -80,18 +80,27 @@ void scheduler_dispatch(Scheduler *sched)
     /* First, reap any finished worker processes */
     scheduler_reap_workers(sched);
 
-    /* Fill available worker slots with WAITING jobs */
+    /* Fill available worker slots with highest-priority WAITING jobs */
     while (sched->active_workers < MAX_WORKERS) {
-        /* Find next WAITING job */
-        Job *next_job = NULL;
+        /*
+         * Priority Queue Selection:
+         * Lower numerical value = Higher scheduling priority (1 = Highest, 10 = Lowest).
+         * Tie-breaker: Earlier submission (smaller job_id).
+         */
+        Job *best_job = NULL;
         for (int i = 0; i < sched->job_count; i++) {
             if (sched->jobs[i].state == JOB_STATE_WAITING) {
-                next_job = &sched->jobs[i];
-                break;
+                if (best_job == NULL) {
+                    best_job = &sched->jobs[i];
+                } else if (sched->jobs[i].priority < best_job->priority) {
+                    best_job = &sched->jobs[i];
+                } else if (sched->jobs[i].priority == best_job->priority && sched->jobs[i].job_id < best_job->job_id) {
+                    best_job = &sched->jobs[i];
+                }
             }
         }
 
-        if (!next_job) {
+        if (!best_job) {
             break; /* No waiting jobs in queue */
         }
 
@@ -109,17 +118,18 @@ void scheduler_dispatch(Scheduler *sched)
         }
 
         /* Launch process asynchronously */
-        pid_t pid = process_spawn_job_async(next_job);
+        pid_t pid = process_spawn_job_async(best_job);
 
         if (pid > 0) {
             free_worker->active = 1;
-            free_worker->current_job_id = next_job->job_id;
+            free_worker->current_job_id = best_job->job_id;
             free_worker->pid = pid;
             sched->active_workers++;
 
-            printf("[SCHEDULER] Dispatched Job ID %d ('%s') -> Worker Slot %d (PID %d)\n",
-                   next_job->job_id,
-                   next_job->full_command,
+            printf("[SCHEDULER] Dispatched Job ID %d ('%s', Priority %d) -> Worker Slot %d (PID %d)\n",
+                   best_job->job_id,
+                   best_job->full_command,
+                   best_job->priority,
                    free_worker->worker_id + 1,
                    pid);
         }
@@ -136,6 +146,11 @@ int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority)
     if (sched->job_count >= MAX_JOBS) {
         printf("Error: Job table is full (max %d jobs).\n", MAX_JOBS);
         return -1;
+    }
+
+    /* Clamp priority to valid range 1..10 if out of range */
+    if (priority < HIGHEST_PRIORITY || priority > LOWEST_PRIORITY) {
+        priority = DEFAULT_PRIORITY;
     }
 
     Job *j = &sched->jobs[sched->job_count];
@@ -173,7 +188,7 @@ int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority)
 
     printf("\nJob Submitted:\n");
     printf("  Job ID:   %d\n", j->job_id);
-    printf("  Priority: %d\n", j->priority);
+    printf("  Priority: %d (1 = Highest, 10 = Lowest)\n", j->priority);
     printf("  Status:   WAITING\n");
 
     /* Try dispatching jobs immediately */
@@ -315,7 +330,7 @@ void scheduler_job_status(const Scheduler *sched, int job_id)
     printf("\nJob Details:\n");
     printf("  Job ID:      %d\n", found->job_id);
     printf("  Command:     %s\n", found->full_command);
-    printf("  Priority:    %d\n", found->priority);
+    printf("  Priority:    %d (1 = Highest, 10 = Lowest)\n", found->priority);
     printf("  State:       %s\n", job_state_to_string(found->state));
     printf("  Worker:      %s\n", worker_str);
     printf("  PID:         %s\n", pid_str);

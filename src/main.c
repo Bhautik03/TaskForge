@@ -40,8 +40,8 @@ static void handle_submit(Scheduler *sched, char *args)
 {
     trim_whitespace(args);
     if (strlen(args) == 0) {
-        printf("Usage: submit <command> [priority]\n");
-        printf("Example: submit sleep 5 10\n\n");
+        printf("Usage: submit <command> [priority (1=Highest, 10=Lowest)]\n");
+        printf("Example: submit sleep 5 2\n\n");
         return;
     }
 
@@ -49,7 +49,7 @@ static void handle_submit(Scheduler *sched, char *args)
     strncpy(cmd_copy, args, MAX_COMMAND_LEN - 1);
     cmd_copy[MAX_COMMAND_LEN - 1] = '\0';
 
-    int priority = 0;
+    int priority = DEFAULT_PRIORITY;
 
     int token_count = 0;
     char temp_tok[MAX_COMMAND_LEN];
@@ -70,7 +70,8 @@ static void handle_submit(Scheduler *sched, char *args)
             sscanf(cmd_copy, "%63s", first_token);
 
             if (strcmp(first_token, "sleep") == 0 && token_count == 2) {
-                priority = 0;
+                /* 'submit sleep 5' -> 5 is duration argument, priority defaults to 5 */
+                priority = DEFAULT_PRIORITY;
             } else {
                 priority = atoi(last_token);
                 *last_space = '\0';
@@ -86,8 +87,9 @@ static void print_help(void)
 {
     printf("\nMulti-Process Job Scheduler CLI (MAX_WORKERS = %d)\n", MAX_WORKERS);
     printf("Available Commands:\n");
-    printf("  submit <command> [priority]  Submit a job to the scheduler (e.g. submit sleep 2)\n");
-    printf("  jobs                         List all jobs and active worker slots\n");
+    printf("  submit <command> [priority]  Submit a job (priority 1=Highest to 10=Lowest, default 5)\n");
+    printf("                               Example: submit sleep 2 1\n");
+    printf("  jobs                         List all jobs, priorities, and active worker slots\n");
     printf("  status <job_id>              Display detailed status for a specific job\n");
     printf("  wait                         Wait for all running and queued jobs to complete\n");
     printf("  help                         Display this help menu\n");
@@ -102,7 +104,8 @@ int main(void)
     char line[MAX_COMMAND_LEN * 2];
 
     printf("=========================================================\n");
-    printf(" Multi-Process Job Scheduler (Phase 6: %d Workers)       \n", MAX_WORKERS);
+    printf(" Multi-Process Job Scheduler (Phase 7: Priority Scheduling) \n");
+    printf(" Priority: 1 = Highest, 10 = Lowest                     \n");
     printf(" Type 'help' for available commands or 'exit' to quit.   \n");
     printf("=========================================================\n\n");
 
