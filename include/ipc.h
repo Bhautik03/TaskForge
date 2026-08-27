@@ -1,6 +1,15 @@
 #ifndef IPC_H
 #define IPC_H
 
-/* IPC module interface placeholder (Pipes, Shared Memory, Semaphores) */
+#include <stddef.h>
+
+/* Creates a unidirectional anonymous pipe */
+int ipc_create_pipe(int pipefd[2]);
+
+/* Sends a string message over specified pipe write file descriptor */
+int ipc_send_message(int write_fd, const char *msg);
+
+/* Non-blocking read of messages from pipe read file descriptor */
+int ipc_read_message(int read_fd, char *buf, size_t max_len);
 
 #endif /* IPC_H */
