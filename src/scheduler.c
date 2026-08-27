@@ -9,6 +9,7 @@
 #include "scheduler.h"
 #include "process.h"
 #include "signals.h"
+#include "ipc.h"
 
 void scheduler_init(Scheduler *sched)
 {
@@ -31,15 +32,26 @@ void scheduler_reap_workers(Scheduler *sched)
     /* Clear pending SIGCHLD flag before harvesting */
     signals_clear_pending_chld();
 
+    /* Read IPC messages from all active worker pipes */
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        Worker *w = &sched->workers[i];
+        if (w->active && w->pipe_read_fd >= 0) {
+            char pipe_buf[256];
+            int ret = ipc_read_message(w->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
+            if (ret > 0) {
+                /* Strip trailing newline for clean printing */
+                size_t len = strlen(pipe_buf);
+                if (len > 0 && pipe_buf[len - 1] == '\n') pipe_buf[len - 1] = '\0';
+                printf("[IPC PIPE] Worker Slot %d (PID %d) -> %s\n",
+                       w->worker_id + 1, w->pid, pipe_buf);
+            }
+        }
+    }
+
     int status = 0;
     pid_t wpid;
 
-    /*
-     * Non-blocking waitpid loop:
-     * Crucial for signal coalescing! Multiple child processes terminating simultaneously
-     * may trigger only ONE SIGCHLD signal. Looping waitpid(-1, &status, WNOHANG) until
-     * it returns <= 0 guarantees ALL terminated child processes are reaped.
-     */
+    /* Non-blocking waitpid harvesting loop */
     while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
         Job *j = NULL;
         for (int i = 0; i < sched->job_count; i++) {
@@ -64,6 +76,19 @@ void scheduler_reap_workers(Scheduler *sched)
         int worker_slot = -1;
         if (w) {
             worker_slot = w->worker_id + 1;
+
+            /* Send COMPLETED / FAILED IPC message status and close pipe descriptor */
+            if (j) {
+                const char *st_msg = (j->state == JOB_STATE_COMPLETED) ? "COMPLETED" : "FAILED";
+                printf("[IPC PIPE] Worker Slot %d (PID %d) -> JOB %d %s\n",
+                       worker_slot, wpid, j->job_id, st_msg);
+            }
+
+            if (w->pipe_read_fd >= 0) {
+                close(w->pipe_read_fd);
+                w->pipe_read_fd = -1;
+            }
+
             w->active = 0;
             w->current_job_id = -1;
             w->pid = -1;
@@ -124,13 +149,15 @@ void scheduler_dispatch(Scheduler *sched)
             break; /* No worker slots available */
         }
 
-        /* Launch process asynchronously */
-        pid_t pid = process_spawn_job_async(best_job);
+        /* Launch process asynchronously with pipe creation */
+        int pipefd[2];
+        pid_t pid = process_spawn_job_async(best_job, pipefd);
 
         if (pid > 0) {
             free_worker->active = 1;
             free_worker->current_job_id = best_job->job_id;
             free_worker->pid = pid;
+            free_worker->pipe_read_fd = pipefd[0];
             sched->active_workers++;
 
             printf("[SCHEDULER] Dispatched Job ID %d ('%s', Priority %d) -> Worker Slot %d (PID %d)\n",
@@ -139,6 +166,16 @@ void scheduler_dispatch(Scheduler *sched)
                    best_job->priority,
                    free_worker->worker_id + 1,
                    pid);
+
+            /* Read initial STARTED message from worker pipe */
+            char pipe_buf[256];
+            int ret = ipc_read_message(free_worker->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
+            if (ret > 0) {
+                size_t len = strlen(pipe_buf);
+                if (len > 0 && pipe_buf[len - 1] == '\n') pipe_buf[len - 1] = '\0';
+                printf("[IPC PIPE] Worker Slot %d (PID %d) -> %s\n",
+                       free_worker->worker_id + 1, pid, pipe_buf);
+            }
         }
     }
 }
@@ -255,9 +292,13 @@ int scheduler_cancel_job(Scheduler *sched, int job_id)
             target->duration = difftime(target->completed_at, target->started_at);
         }
 
-        /* Free worker slot */
+        /* Free worker slot and close pipe */
         for (int k = 0; k < MAX_WORKERS; k++) {
             if (sched->workers[k].current_job_id == job_id) {
+                if (sched->workers[k].pipe_read_fd >= 0) {
+                    close(sched->workers[k].pipe_read_fd);
+                    sched->workers[k].pipe_read_fd = -1;
+                }
                 sched->workers[k].active = 0;
                 sched->workers[k].current_job_id = -1;
                 sched->workers[k].pid = -1;
