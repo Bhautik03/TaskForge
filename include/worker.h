@@ -9,6 +9,7 @@ typedef struct {
     int active;         /* 1 if slot is active, 0 if idle */
     int current_job_id; /* ID of assigned Job (-1 if idle) */
     pid_t pid;          /* PID of child process (-1 if idle) */
+    int pipe_read_fd;   /* Read end of IPC pipe from worker to scheduler */
 } Worker;
 
 void worker_init(Worker *w, int id);
