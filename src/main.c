@@ -9,7 +9,6 @@ static void trim_whitespace(char *str)
 {
     if (!str) return;
 
-    /* Trim leading whitespace */
     char *start = str;
     while (isspace((unsigned char)*start)) {
         start++;
@@ -19,7 +18,6 @@ static void trim_whitespace(char *str)
         memmove(str, start, strlen(start) + 1);
     }
 
-    /* Trim trailing whitespace */
     size_t len = strlen(str);
     while (len > 0 && isspace((unsigned char)str[len - 1])) {
         str[--len] = '\0';
@@ -87,7 +85,7 @@ static void print_help(void)
     printf("\nMulti-Process Job Scheduler CLI (MAX_WORKERS = %d)\n", MAX_WORKERS);
     printf("Available Commands:\n");
     printf("  submit <command> [priority]  Submit a job (priority 1=Highest to 10=Lowest, default 5)\n");
-    printf("  jobs                         List all jobs, priorities, and active worker slots\n");
+    printf("  jobs                         List all jobs, priorities, active workers & SHM state\n");
     printf("  status <job_id>              Display detailed status for a specific job\n");
     printf("  pause <job_id>               Pause a running job (sends SIGSTOP)\n");
     printf("  resume <job_id>              Resume a paused job (sends SIGCONT)\n");
@@ -105,7 +103,7 @@ int main(void)
     char line[MAX_COMMAND_LEN * 2];
 
     printf("=========================================================\n");
-    printf(" Multi-Process Job Scheduler (Phase 8: Signal Control)   \n");
+    printf(" Multi-Process Job Scheduler (Phase 12: Shared Memory)  \n");
     printf(" Priority: 1 = Highest, 10 = Lowest                     \n");
     printf(" Type 'help' for available commands or 'exit' to quit.   \n");
     printf("=========================================================\n\n");
@@ -191,5 +189,6 @@ int main(void)
         }
     }
 
+    scheduler_cleanup(&sched);
     return 0;
 }

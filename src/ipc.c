@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/select.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include "ipc.h"
 
 int ipc_create_pipe(int pipefd[2])
@@ -102,4 +104,66 @@ int ipc_select_pipes(const int *read_fds, int count, int *ready_flags, int timeo
     }
 
     return ret;
+}
+
+key_t ipc_get_key(const char *path, int proj_id)
+{
+    key_t key = ftok(path ? path : ".", proj_id);
+    if (key == -1) {
+        perror("ftok failed");
+    }
+    return key;
+}
+
+int ipc_shm_create(key_t key, size_t size, int *out_shmid)
+{
+    if (key == -1 || size == 0 || !out_shmid) return -1;
+
+    /* Allocate shared memory segment with read/write permissions for owner */
+    int shmid = shmget(key, size, IPC_CREAT | IPC_EXCL | 0666);
+    if (shmid < 0) {
+        if (errno == EEXIST) {
+            /* Segment exists, connect to existing segment */
+            shmid = shmget(key, size, 0666);
+        }
+    }
+
+    if (shmid < 0) {
+        perror("shmget failed");
+        return -1;
+    }
+
+    *out_shmid = shmid;
+    return 0;
+}
+
+void *ipc_shm_attach(int shmid)
+{
+    if (shmid < 0) return NULL;
+    void *shmaddr = shmat(shmid, NULL, 0);
+    if (shmaddr == (void *)-1) {
+        perror("shmat failed");
+        return NULL;
+    }
+    return shmaddr;
+}
+
+int ipc_shm_detach(const void *shmaddr)
+{
+    if (!shmaddr) return -1;
+    if (shmdt(shmaddr) < 0) {
+        perror("shmdt failed");
+        return -1;
+    }
+    return 0;
+}
+
+int ipc_shm_remove(int shmid)
+{
+    if (shmid < 0) return -1;
+    if (shmctl(shmid, IPC_RMID, NULL) < 0) {
+        perror("shmctl IPC_RMID failed");
+        return -1;
+    }
+    return 0;
 }

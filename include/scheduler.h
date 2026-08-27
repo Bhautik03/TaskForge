@@ -3,6 +3,7 @@
 
 #include "job.h"
 #include "worker.h"
+#include "ipc.h"
 
 typedef struct {
     Job jobs[MAX_JOBS];
@@ -10,9 +11,13 @@ typedef struct {
     int next_job_id;
     Worker workers[MAX_WORKERS];
     int active_workers;
+    int shmid;                       /* System V Shared Memory Identifier */
+    SharedSchedulerState *shm;      /* Pointer to attached Shared Memory */
 } Scheduler;
 
 void scheduler_init(Scheduler *sched);
+void scheduler_cleanup(Scheduler *sched);
+void scheduler_sync_shm(Scheduler *sched);
 int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority);
 void scheduler_dispatch(Scheduler *sched);
 void scheduler_reap_workers(Scheduler *sched);
