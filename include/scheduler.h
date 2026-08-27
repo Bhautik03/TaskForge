@@ -13,6 +13,7 @@ typedef struct {
     int active_workers;
     int shmid;                       /* System V Shared Memory Identifier */
     SharedSchedulerState *shm;      /* Pointer to attached Shared Memory */
+    int semid;                       /* System V Semaphore Identifier */
 } Scheduler;
 
 void scheduler_init(Scheduler *sched);

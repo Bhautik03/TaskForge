@@ -9,6 +9,7 @@
 #include <sys/select.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/sem.h>
 #include "scheduler.h"
 #include "process.h"
 #include "signals.h"
@@ -18,6 +19,10 @@ void scheduler_sync_shm(Scheduler *sched)
 {
     if (!sched || !sched->shm) return;
 
+    /* P() Operation: Acquire Binary Semaphore Lock before entering Critical Section */
+    ipc_sem_lock(sched->semid);
+
+    /* --- CRITICAL SECTION START --- */
     sched->shm->total_jobs = sched->job_count;
     sched->shm->active_workers = sched->active_workers;
 
@@ -37,6 +42,10 @@ void scheduler_sync_shm(Scheduler *sched)
     sched->shm->completed_jobs = completed;
     sched->shm->failed_jobs = failed;
     sched->shm->cancelled_jobs = cancelled;
+    /* --- CRITICAL SECTION END --- */
+
+    /* V() Operation: Release Binary Semaphore Lock */
+    ipc_sem_unlock(sched->semid);
 }
 
 void scheduler_init(Scheduler *sched)
@@ -47,6 +56,7 @@ void scheduler_init(Scheduler *sched)
     sched->active_workers = 0;
     sched->shmid = -1;
     sched->shm = NULL;
+    sched->semid = -1;
 
     for (int i = 0; i < MAX_WORKERS; i++) {
         worker_init(&sched->workers[i], i);
@@ -54,7 +64,7 @@ void scheduler_init(Scheduler *sched)
 
     signals_init();
 
-    /* Initialize System V Shared Memory segment */
+    /* Initialize System V Shared Memory & Semaphore */
     key_t key = ipc_get_key("/tmp", 'S');
     if (key != -1) {
         if (ipc_shm_create(key, sizeof(SharedSchedulerState), &sched->shmid) == 0) {
@@ -62,9 +72,15 @@ void scheduler_init(Scheduler *sched)
             if (sched->shm) {
                 memset(sched->shm, 0, sizeof(SharedSchedulerState));
                 sched->shm->scheduler_start_time = time(NULL);
-                printf("[SYSTEM V SHM] Shared Memory Created & Attached (SHMID: %d, Key: 0x%x, Size: %zu bytes)\n\n",
+                printf("[SYSTEM V SHM] Shared Memory Created & Attached (SHMID: %d, Key: 0x%x, Size: %zu bytes)\n",
                        sched->shmid, key, sizeof(SharedSchedulerState));
             }
+        }
+
+        if (ipc_sem_create(key, &sched->semid) == 0) {
+            ipc_sem_init(sched->semid, 1); /* Initialize binary semaphore to 1 */
+            printf("[SYSTEM V SEMAPHORE] Binary Semaphore Initialized (SEMID: %d, Key: 0x%x, Value: 1)\n\n",
+                   sched->semid, key);
         }
     }
 }
@@ -82,6 +98,12 @@ void scheduler_cleanup(Scheduler *sched)
         ipc_shm_remove(sched->shmid);
         printf("[SYSTEM V SHM] Shared Memory Segment %d Detached & Removed.\n", sched->shmid);
         sched->shmid = -1;
+    }
+
+    if (sched->semid >= 0) {
+        ipc_sem_remove(sched->semid);
+        printf("[SYSTEM V SEMAPHORE] Semaphore Identifier %d Removed.\n", sched->semid);
+        sched->semid = -1;
     }
 }
 
@@ -186,7 +208,7 @@ void scheduler_reap_workers(Scheduler *sched)
         }
     }
 
-    /* Synchronize shared memory state */
+    /* Synchronize shared memory state safely inside critical section */
     scheduler_sync_shm(sched);
 }
 
@@ -248,7 +270,7 @@ void scheduler_dispatch(Scheduler *sched)
         }
     }
 
-    /* Synchronize shared memory state */
+    /* Synchronize shared memory state safely inside critical section */
     scheduler_sync_shm(sched);
 }
 
@@ -532,12 +554,15 @@ void scheduler_list_jobs(const Scheduler *sched)
     }
 
     if (sched->shm) {
-        printf("\n[SYSTEM V SHM TELEMETRY] Total: %d | Running: %d | Completed: %d | Failed: %d | Cancelled: %d\n",
+        /* Safely read SHM metrics under semaphore protection */
+        ipc_sem_lock(sched->semid);
+        printf("\n[SYSTEM V SHM + SEM TELEMETRY] Total: %d | Running: %d | Completed: %d | Failed: %d | Cancelled: %d\n",
                sched->shm->total_jobs,
                sched->shm->running_jobs,
                sched->shm->completed_jobs,
                sched->shm->failed_jobs,
                sched->shm->cancelled_jobs);
+        ipc_sem_unlock(sched->semid);
     }
     printf("\n");
 }

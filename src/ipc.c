@@ -8,6 +8,7 @@
 #include <sys/select.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/sem.h>
 #include "ipc.h"
 
 int ipc_create_pipe(int pipefd[2])
@@ -119,11 +120,9 @@ int ipc_shm_create(key_t key, size_t size, int *out_shmid)
 {
     if (key == -1 || size == 0 || !out_shmid) return -1;
 
-    /* Allocate shared memory segment with read/write permissions for owner */
     int shmid = shmget(key, size, IPC_CREAT | IPC_EXCL | 0666);
     if (shmid < 0) {
         if (errno == EEXIST) {
-            /* Segment exists, connect to existing segment */
             shmid = shmget(key, size, 0666);
         }
     }
@@ -163,6 +162,92 @@ int ipc_shm_remove(int shmid)
     if (shmid < 0) return -1;
     if (shmctl(shmid, IPC_RMID, NULL) < 0) {
         perror("shmctl IPC_RMID failed");
+        return -1;
+    }
+    return 0;
+}
+
+/* System V Semaphore API Functions */
+
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+};
+
+int ipc_sem_create(key_t key, int *out_semid)
+{
+    if (key == -1 || !out_semid) return -1;
+
+    int semid = semget(key, 1, IPC_CREAT | IPC_EXCL | 0666);
+    if (semid < 0 && errno == EEXIST) {
+        semid = semget(key, 1, 0666);
+    }
+
+    if (semid < 0) {
+        perror("semget failed");
+        return -1;
+    }
+
+    *out_semid = semid;
+    return 0;
+}
+
+int ipc_sem_init(int semid, int val)
+{
+    if (semid < 0) return -1;
+
+    union semun arg;
+    arg.val = val;
+    if (semctl(semid, 0, SETVAL, arg) < 0) {
+        perror("semctl SETVAL failed");
+        return -1;
+    }
+    return 0;
+}
+
+int ipc_sem_lock(int semid)
+{
+    if (semid < 0) return -1;
+
+    struct sembuf sb;
+    sb.sem_num = 0;
+    sb.sem_op = -1;         /* P() operation: Decrement / Wait for lock */
+    sb.sem_flg = SEM_UNDO;  /* Kernel auto-releases lock if process crashes */
+
+    if (semop(semid, &sb, 1) < 0) {
+        if (errno != EINTR) {
+            perror("semop P() lock failed");
+        }
+        return -1;
+    }
+    return 0;
+}
+
+int ipc_sem_unlock(int semid)
+{
+    if (semid < 0) return -1;
+
+    struct sembuf sb;
+    sb.sem_num = 0;
+    sb.sem_op = 1;          /* V() operation: Increment / Signal unlock */
+    sb.sem_flg = SEM_UNDO;  /* Kernel auto-adjusts undo counter */
+
+    if (semop(semid, &sb, 1) < 0) {
+        perror("semop V() unlock failed");
+        return -1;
+    }
+    return 0;
+}
+
+int ipc_sem_remove(int semid)
+{
+    if (semid < 0) return -1;
+
+    union semun arg;
+    arg.val = 0;
+    if (semctl(semid, 0, IPC_RMID, arg) < 0) {
+        perror("semctl IPC_RMID failed");
         return -1;
     }
     return 0;

@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/sem.h>
 #include <sys/select.h>
 #include "job.h"
 
@@ -38,5 +39,12 @@ int ipc_shm_create(key_t key, size_t size, int *out_shmid);
 void *ipc_shm_attach(int shmid);
 int ipc_shm_detach(const void *shmaddr);
 int ipc_shm_remove(int shmid);
+
+/* System V Semaphore Synchronization Functions */
+int ipc_sem_create(key_t key, int *out_semid);
+int ipc_sem_init(int semid, int val);
+int ipc_sem_lock(int semid);   /* P() Operation: Wait / Decrement */
+int ipc_sem_unlock(int semid); /* V() Operation: Signal / Increment */
+int ipc_sem_remove(int semid);
 
 #endif /* IPC_H */
