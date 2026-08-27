@@ -7,4 +7,5 @@ void worker_init(Worker *w, int id)
     w->active = 0;
     w->current_job_id = -1;
     w->pid = -1;
+    w->pipe_read_fd = -1;
 }
