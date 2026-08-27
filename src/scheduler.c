@@ -5,8 +5,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include "scheduler.h"
 #include "process.h"
+#include "signals.h"
 
 void scheduler_init(Scheduler *sched)
 {
@@ -18,6 +20,8 @@ void scheduler_init(Scheduler *sched)
     for (int i = 0; i < MAX_WORKERS; i++) {
         worker_init(&sched->workers[i], i);
     }
+
+    signals_init();
 }
 
 void scheduler_reap_workers(Scheduler *sched)
@@ -45,7 +49,7 @@ void scheduler_reap_workers(Scheduler *sched)
             }
         }
 
-        if (j) {
+        if (j && j->state != JOB_STATE_CANCELLED) {
             process_evaluate_exit_status(j, status);
         }
 
@@ -60,7 +64,7 @@ void scheduler_reap_workers(Scheduler *sched)
             }
         }
 
-        if (j) {
+        if (j && j->state != JOB_STATE_CANCELLED) {
             printf("\n[SCHEDULER] Worker Slot %d (PID %d) finished Job ID %d ('%s') -> State: %s (Exit Code: %d, Duration: %.2fs)\n",
                    worker_slot > 0 ? worker_slot : 0,
                    wpid,
@@ -82,11 +86,6 @@ void scheduler_dispatch(Scheduler *sched)
 
     /* Fill available worker slots with highest-priority WAITING jobs */
     while (sched->active_workers < MAX_WORKERS) {
-        /*
-         * Priority Queue Selection:
-         * Lower numerical value = Higher scheduling priority (1 = Highest, 10 = Lowest).
-         * Tie-breaker: Earlier submission (smaller job_id).
-         */
         Job *best_job = NULL;
         for (int i = 0; i < sched->job_count; i++) {
             if (sched->jobs[i].state == JOB_STATE_WAITING) {
@@ -197,6 +196,152 @@ int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority)
     return j->job_id;
 }
 
+int scheduler_cancel_job(Scheduler *sched, int job_id)
+{
+    if (!sched) return -1;
+
+    Job *target = NULL;
+    for (int i = 0; i < sched->job_count; i++) {
+        if (sched->jobs[i].job_id == job_id) {
+            target = &sched->jobs[i];
+            break;
+        }
+    }
+
+    if (!target) {
+        printf("\nError: Job ID %d not found.\n\n", job_id);
+        return -1;
+    }
+
+    if (target->state == JOB_STATE_COMPLETED || target->state == JOB_STATE_FAILED || target->state == JOB_STATE_CANCELLED) {
+        printf("\nError: Cannot cancel Job ID %d (Current state: %s).\n\n",
+               job_id, job_state_to_string(target->state));
+        return -1;
+    }
+
+    if (target->state == JOB_STATE_WAITING) {
+        target->state = JOB_STATE_CANCELLED;
+        target->completed_at = time(NULL);
+        printf("\n[SCHEDULER] Job ID %d ('%s') cancelled from waiting queue.\n\n",
+               job_id, target->full_command);
+        return 0;
+    }
+
+    /* Target is RUNNING or STOPPED */
+    if (target->pid > 0) {
+        if (target->state == JOB_STATE_STOPPED) {
+            /* Wake up process with SIGCONT so it handles SIGTERM */
+            signals_send(target->pid, SIGCONT);
+        }
+
+        signals_send(target->pid, SIGTERM);
+
+        int status = 0;
+        waitpid(target->pid, &status, 0);
+
+        target->state = JOB_STATE_CANCELLED;
+        target->term_sig = SIGTERM;
+        target->exit_code = 128 + SIGTERM;
+        target->completed_at = time(NULL);
+        if (target->started_at > 0) {
+            target->duration = difftime(target->completed_at, target->started_at);
+        }
+
+        /* Free worker slot */
+        for (int k = 0; k < MAX_WORKERS; k++) {
+            if (sched->workers[k].current_job_id == job_id) {
+                sched->workers[k].active = 0;
+                sched->workers[k].current_job_id = -1;
+                sched->workers[k].pid = -1;
+                if (sched->active_workers > 0) sched->active_workers--;
+                break;
+            }
+        }
+
+        printf("\n[SCHEDULER] Job ID %d (PID %d) cancelled via SIGTERM.\n\n", job_id, target->pid);
+
+        /* Try dispatching next waiting job into freed worker slot */
+        scheduler_dispatch(sched);
+        return 0;
+    }
+
+    return -1;
+}
+
+int scheduler_pause_job(Scheduler *sched, int job_id)
+{
+    if (!sched) return -1;
+
+    Job *target = NULL;
+    for (int i = 0; i < sched->job_count; i++) {
+        if (sched->jobs[i].job_id == job_id) {
+            target = &sched->jobs[i];
+            break;
+        }
+    }
+
+    if (!target) {
+        printf("\nError: Job ID %d not found.\n\n", job_id);
+        return -1;
+    }
+
+    if (target->state != JOB_STATE_RUNNING) {
+        printf("\nError: Cannot pause Job ID %d (Current state: %s). Job must be RUNNING.\n\n",
+               job_id, job_state_to_string(target->state));
+        return -1;
+    }
+
+    if (target->pid > 0) {
+        if (signals_send(target->pid, SIGSTOP) == 0) {
+            target->state = JOB_STATE_STOPPED;
+            printf("\n[SCHEDULER] Job ID %d (PID %d) paused (SIGSTOP sent).\n\n", job_id, target->pid);
+            return 0;
+        } else {
+            perror("Failed to send SIGSTOP");
+            return -1;
+        }
+    }
+
+    return -1;
+}
+
+int scheduler_resume_job(Scheduler *sched, int job_id)
+{
+    if (!sched) return -1;
+
+    Job *target = NULL;
+    for (int i = 0; i < sched->job_count; i++) {
+        if (sched->jobs[i].job_id == job_id) {
+            target = &sched->jobs[i];
+            break;
+        }
+    }
+
+    if (!target) {
+        printf("\nError: Job ID %d not found.\n\n", job_id);
+        return -1;
+    }
+
+    if (target->state != JOB_STATE_STOPPED) {
+        printf("\nError: Cannot resume Job ID %d (Current state: %s). Job must be STOPPED.\n\n",
+               job_id, job_state_to_string(target->state));
+        return -1;
+    }
+
+    if (target->pid > 0) {
+        if (signals_send(target->pid, SIGCONT) == 0) {
+            target->state = JOB_STATE_RUNNING;
+            printf("\n[SCHEDULER] Job ID %d (PID %d) resumed (SIGCONT sent).\n\n", job_id, target->pid);
+            return 0;
+        } else {
+            perror("Failed to send SIGCONT");
+            return -1;
+        }
+    }
+
+    return -1;
+}
+
 void scheduler_wait_all(Scheduler *sched)
 {
     if (!sched) return;
@@ -208,7 +353,7 @@ void scheduler_wait_all(Scheduler *sched)
 
         int pending = 0;
         for (int i = 0; i < sched->job_count; i++) {
-            if (sched->jobs[i].state == JOB_STATE_WAITING || sched->jobs[i].state == JOB_STATE_RUNNING) {
+            if (sched->jobs[i].state == JOB_STATE_WAITING || sched->jobs[i].state == JOB_STATE_RUNNING || sched->jobs[i].state == JOB_STATE_STOPPED) {
                 pending++;
             }
         }
@@ -256,7 +401,7 @@ void scheduler_list_jobs(const Scheduler *sched)
         }
 
         char dur_str[32];
-        if (j->state == JOB_STATE_COMPLETED || j->state == JOB_STATE_FAILED) {
+        if (j->state == JOB_STATE_COMPLETED || j->state == JOB_STATE_FAILED || j->state == JOB_STATE_CANCELLED) {
             snprintf(dur_str, sizeof(dur_str), "%.2fs", j->duration);
         } else {
             snprintf(dur_str, sizeof(dur_str), "-");
@@ -337,7 +482,7 @@ void scheduler_job_status(const Scheduler *sched, int job_id)
     printf("  Exit Code:   %d\n", found->exit_code);
 
     if (found->term_sig > 0) {
-        printf("  Term Signal: %d\n", found->term_sig);
+        printf("  Term Signal: %d (%s)\n", found->term_sig, strsignal(found->term_sig));
     }
 
     printf("  Created At:  %s\n", created_str);
