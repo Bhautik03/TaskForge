@@ -4,8 +4,8 @@
 #include <sys/types.h>
 #include "job.h"
 
-/* Spawns child process asynchronously using fork() + execvp() */
-pid_t process_spawn_job_async(Job *job);
+/* Spawns child process asynchronously with IPC pipe setup */
+pid_t process_spawn_job_async(Job *job, int out_pipefd[2]);
 
 /* Analyzes status integer from waitpid() and updates job state, exit code, and duration */
 void process_evaluate_exit_status(Job *job, int status);
