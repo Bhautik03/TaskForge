@@ -20,4 +20,9 @@ void scheduler_wait_all(Scheduler *sched);
 void scheduler_list_jobs(const Scheduler *sched);
 void scheduler_job_status(const Scheduler *sched, int job_id);
 
+/* Phase 8: Signal control functions */
+int scheduler_cancel_job(Scheduler *sched, int job_id);
+int scheduler_pause_job(Scheduler *sched, int job_id);
+int scheduler_resume_job(Scheduler *sched, int job_id);
+
 #endif /* SCHEDULER_H */
