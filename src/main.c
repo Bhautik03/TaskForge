@@ -70,7 +70,6 @@ static void handle_submit(Scheduler *sched, char *args)
             sscanf(cmd_copy, "%63s", first_token);
 
             if (strcmp(first_token, "sleep") == 0 && token_count == 2) {
-                /* 'submit sleep 5' -> 5 is duration argument, priority defaults to 5 */
                 priority = DEFAULT_PRIORITY;
             } else {
                 priority = atoi(last_token);
@@ -88,9 +87,11 @@ static void print_help(void)
     printf("\nMulti-Process Job Scheduler CLI (MAX_WORKERS = %d)\n", MAX_WORKERS);
     printf("Available Commands:\n");
     printf("  submit <command> [priority]  Submit a job (priority 1=Highest to 10=Lowest, default 5)\n");
-    printf("                               Example: submit sleep 2 1\n");
     printf("  jobs                         List all jobs, priorities, and active worker slots\n");
     printf("  status <job_id>              Display detailed status for a specific job\n");
+    printf("  pause <job_id>               Pause a running job (sends SIGSTOP)\n");
+    printf("  resume <job_id>              Resume a paused job (sends SIGCONT)\n");
+    printf("  cancel <job_id>              Cancel a job (sends SIGTERM)\n");
     printf("  wait                         Wait for all running and queued jobs to complete\n");
     printf("  help                         Display this help menu\n");
     printf("  exit                         Exit the scheduler program\n\n");
@@ -104,7 +105,7 @@ int main(void)
     char line[MAX_COMMAND_LEN * 2];
 
     printf("=========================================================\n");
-    printf(" Multi-Process Job Scheduler (Phase 7: Priority Scheduling) \n");
+    printf(" Multi-Process Job Scheduler (Phase 8: Signal Control)   \n");
     printf(" Priority: 1 = Highest, 10 = Lowest                     \n");
     printf(" Type 'help' for available commands or 'exit' to quit.   \n");
     printf("=========================================================\n\n");
@@ -153,6 +154,30 @@ int main(void)
             } else {
                 int job_id = atoi(args);
                 scheduler_job_status(&sched, job_id);
+            }
+        } else if (strcmp(command, "pause") == 0) {
+            trim_whitespace(args);
+            if (strlen(args) == 0 || !is_numeric_str(args)) {
+                printf("Usage: pause <job_id>\n\n");
+            } else {
+                int job_id = atoi(args);
+                scheduler_pause_job(&sched, job_id);
+            }
+        } else if (strcmp(command, "resume") == 0) {
+            trim_whitespace(args);
+            if (strlen(args) == 0 || !is_numeric_str(args)) {
+                printf("Usage: resume <job_id>\n\n");
+            } else {
+                int job_id = atoi(args);
+                scheduler_resume_job(&sched, job_id);
+            }
+        } else if (strcmp(command, "cancel") == 0) {
+            trim_whitespace(args);
+            if (strlen(args) == 0 || !is_numeric_str(args)) {
+                printf("Usage: cancel <job_id>\n\n");
+            } else {
+                int job_id = atoi(args);
+                scheduler_cancel_job(&sched, job_id);
             }
         } else if (strcmp(command, "wait") == 0) {
             scheduler_wait_all(&sched);
