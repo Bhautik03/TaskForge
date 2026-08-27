@@ -28,10 +28,18 @@ void scheduler_reap_workers(Scheduler *sched)
 {
     if (!sched) return;
 
+    /* Clear pending SIGCHLD flag before harvesting */
+    signals_clear_pending_chld();
+
     int status = 0;
     pid_t wpid;
 
-    /* Non-blocking check for any terminated child process */
+    /*
+     * Non-blocking waitpid loop:
+     * Crucial for signal coalescing! Multiple child processes terminating simultaneously
+     * may trigger only ONE SIGCHLD signal. Looping waitpid(-1, &status, WNOHANG) until
+     * it returns <= 0 guarantees ALL terminated child processes are reaped.
+     */
     while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
         Job *j = NULL;
         for (int i = 0; i < sched->job_count; i++) {
@@ -65,7 +73,7 @@ void scheduler_reap_workers(Scheduler *sched)
         }
 
         if (j && j->state != JOB_STATE_CANCELLED) {
-            printf("\n[SCHEDULER] Worker Slot %d (PID %d) finished Job ID %d ('%s') -> State: %s (Exit Code: %d, Duration: %.2fs)\n",
+            printf("\n[SIGCHLD REAPER] Worker Slot %d (PID %d) finished Job ID %d ('%s') -> State: %s (Exit Code: %d, Duration: %.2fs)\n",
                    worker_slot > 0 ? worker_slot : 0,
                    wpid,
                    j->job_id,
@@ -81,7 +89,7 @@ void scheduler_dispatch(Scheduler *sched)
 {
     if (!sched) return;
 
-    /* First, reap any finished worker processes */
+    /* First, reap any finished worker processes notified via SIGCHLD or timer */
     scheduler_reap_workers(sched);
 
     /* Fill available worker slots with highest-priority WAITING jobs */
