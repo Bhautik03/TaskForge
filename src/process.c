@@ -7,11 +7,17 @@
 #include <sys/wait.h>
 #include <time.h>
 #include "process.h"
+#include "ipc.h"
 
-pid_t process_spawn_job_async(Job *job)
+pid_t process_spawn_job_async(Job *job, int out_pipefd[2])
 {
     if (!job || job->arg_count == 0 || job->args[0] == NULL) {
         printf("Error: No command provided for execution.\n");
+        return -1;
+    }
+
+    int pipefd[2];
+    if (ipc_create_pipe(pipefd) < 0) {
         return -1;
     }
 
@@ -21,24 +27,44 @@ pid_t process_spawn_job_async(Job *job)
 
     if (pid < 0) {
         perror("fork failed");
+        close(pipefd[0]);
+        close(pipefd[1]);
         job->state = JOB_STATE_FAILED;
         job->completed_at = time(NULL);
         job->duration = difftime(job->completed_at, job->started_at);
         return -1;
     } 
     else if (pid == 0) {
-        /* Child Process: Replace memory image with binary */
+        /* Child Process: Close unused read end of pipe */
+        close(pipefd[0]);
+
+        /* Send STARTED message over pipe to scheduler */
+        char msg[128];
+        snprintf(msg, sizeof(msg), "JOB %d STARTED\n", job->job_id);
+        ipc_send_message(pipefd[1], msg);
+
+        /* Replace child image with binary */
         execvp(job->args[0], job->args);
 
-        /* Reached only on execvp failure */
+        /* Reached only if execvp fails */
         fprintf(stderr, "\n[WORKER CHILD PID %d] execvp failed for '%s': %s\n",
                 getpid(), job->args[0], strerror(errno));
-        
-        /* POSIX standard exit code 127 for execution failure */
+
+        snprintf(msg, sizeof(msg), "JOB %d FAILED\n", job->job_id);
+        ipc_send_message(pipefd[1], msg);
+        close(pipefd[1]);
+
         exit(127);
     } 
     else {
-        /* Parent Process */
+        /* Parent Process: Close unused write end of pipe */
+        close(pipefd[1]);
+
+        if (out_pipefd) {
+            out_pipefd[0] = pipefd[0];
+            out_pipefd[1] = -1;
+        }
+
         job->pid = pid;
         job->state = JOB_STATE_RUNNING;
         return pid;
