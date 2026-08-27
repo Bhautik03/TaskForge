@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <sys/select.h>
 #include "scheduler.h"
 #include "process.h"
 #include "signals.h"
@@ -32,18 +33,40 @@ void scheduler_reap_workers(Scheduler *sched)
     /* Clear pending SIGCHLD flag before harvesting */
     signals_clear_pending_chld();
 
-    /* Read IPC messages from all active worker pipes */
+    /* 
+     * Synchronous I/O Multiplexing via select():
+     * Gather all open worker pipe file descriptors and monitor them simultaneously.
+     * select() tells us precisely which descriptors have unread data ready.
+     */
+    int fds[MAX_WORKERS];
+    int ready[MAX_WORKERS];
+    int active_pipe_count = 0;
+
     for (int i = 0; i < MAX_WORKERS; i++) {
         Worker *w = &sched->workers[i];
         if (w->active && w->pipe_read_fd >= 0) {
-            char pipe_buf[256];
-            int ret = ipc_read_message(w->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
-            if (ret > 0) {
-                /* Strip trailing newline for clean printing */
-                size_t len = strlen(pipe_buf);
-                if (len > 0 && pipe_buf[len - 1] == '\n') pipe_buf[len - 1] = '\0';
-                printf("[IPC PIPE] Worker Slot %d (PID %d) -> %s\n",
-                       w->worker_id + 1, w->pid, pipe_buf);
+            fds[i] = w->pipe_read_fd;
+            active_pipe_count++;
+        } else {
+            fds[i] = -1;
+        }
+    }
+
+    if (active_pipe_count > 0) {
+        int sel_ret = ipc_select_pipes(fds, MAX_WORKERS, ready, 10);
+        if (sel_ret > 0) {
+            for (int i = 0; i < MAX_WORKERS; i++) {
+                if (ready[i]) {
+                    Worker *w = &sched->workers[i];
+                    char pipe_buf[256];
+                    int bytes_read = ipc_read_message(w->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
+                    if (bytes_read > 0) {
+                        size_t len = strlen(pipe_buf);
+                        if (len > 0 && pipe_buf[len - 1] == '\n') pipe_buf[len - 1] = '\0';
+                        printf("[SELECT MULTIPLEXER] Worker Slot %d (PID %d, FD %d) readable -> %s\n",
+                               w->worker_id + 1, w->pid, w->pipe_read_fd, pipe_buf);
+                    }
+                }
             }
         }
     }
@@ -77,10 +100,9 @@ void scheduler_reap_workers(Scheduler *sched)
         if (w) {
             worker_slot = w->worker_id + 1;
 
-            /* Send COMPLETED / FAILED IPC message status and close pipe descriptor */
             if (j) {
                 const char *st_msg = (j->state == JOB_STATE_COMPLETED) ? "COMPLETED" : "FAILED";
-                printf("[IPC PIPE] Worker Slot %d (PID %d) -> JOB %d %s\n",
+                printf("[SELECT MULTIPLEXER] Worker Slot %d (PID %d) -> JOB %d %s\n",
                        worker_slot, wpid, j->job_id, st_msg);
             }
 
@@ -114,7 +136,7 @@ void scheduler_dispatch(Scheduler *sched)
 {
     if (!sched) return;
 
-    /* First, reap any finished worker processes notified via SIGCHLD or timer */
+    /* First, reap any finished worker processes notified via SIGCHLD or select multiplexer */
     scheduler_reap_workers(sched);
 
     /* Fill available worker slots with highest-priority WAITING jobs */
@@ -160,22 +182,13 @@ void scheduler_dispatch(Scheduler *sched)
             free_worker->pipe_read_fd = pipefd[0];
             sched->active_workers++;
 
-            printf("[SCHEDULER] Dispatched Job ID %d ('%s', Priority %d) -> Worker Slot %d (PID %d)\n",
+            printf("[SCHEDULER] Dispatched Job ID %d ('%s', Priority %d) -> Worker Slot %d (PID %d, Pipe FD %d)\n",
                    best_job->job_id,
                    best_job->full_command,
                    best_job->priority,
                    free_worker->worker_id + 1,
-                   pid);
-
-            /* Read initial STARTED message from worker pipe */
-            char pipe_buf[256];
-            int ret = ipc_read_message(free_worker->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
-            if (ret > 0) {
-                size_t len = strlen(pipe_buf);
-                if (len > 0 && pipe_buf[len - 1] == '\n') pipe_buf[len - 1] = '\0';
-                printf("[IPC PIPE] Worker Slot %d (PID %d) -> %s\n",
-                       free_worker->worker_id + 1, pid, pipe_buf);
-            }
+                   pid,
+                   free_worker->pipe_read_fd);
         }
     }
 }

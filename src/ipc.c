@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/select.h>
 #include "ipc.h"
 
 int ipc_create_pipe(int pipefd[2])
@@ -55,4 +56,50 @@ int ipc_read_message(int read_fd, char *buf, size_t max_len)
         buf[0] = '\0';
         return -1;
     }
+}
+
+int ipc_select_pipes(const int *read_fds, int count, int *ready_flags, int timeout_ms)
+{
+    if (!read_fds || !ready_flags || count <= 0) return -1;
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    int max_fd = -1;
+
+    for (int i = 0; i < count; i++) {
+        ready_flags[i] = 0;
+        if (read_fds[i] >= 0) {
+            FD_SET(read_fds[i], &readfds);
+            if (read_fds[i] > max_fd) {
+                max_fd = read_fds[i];
+            }
+        }
+    }
+
+    if (max_fd < 0) return 0;
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    int ret = select(max_fd + 1, &readfds, NULL, NULL, &tv);
+
+    if (ret < 0) {
+        if (errno == EINTR) {
+            /* Interrupted by signal (e.g. SIGCHLD) */
+            return 0;
+        }
+        perror("select failed");
+        return -1;
+    }
+
+    if (ret > 0) {
+        for (int i = 0; i < count; i++) {
+            if (read_fds[i] >= 0 && FD_ISSET(read_fds[i], &readfds)) {
+                ready_flags[i] = 1;
+            }
+        }
+    }
+
+    return ret;
 }
