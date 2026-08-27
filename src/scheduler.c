@@ -15,14 +15,89 @@
 #include "signals.h"
 #include "ipc.h"
 
+/* =========================================================================
+ * STATIC HELPER FUNCTIONS (Encapsulates repeated lookup loops)
+ * ========================================================================= */
+
+static Job *find_job(Scheduler *sched, int job_id)
+{
+    if (!sched) {
+        return NULL;
+    }
+    for (int i = 0; i < sched->job_count; i++) {
+        if (sched->jobs[i].job_id == job_id) {
+            return &sched->jobs[i];
+        }
+    }
+    return NULL;
+}
+
+static Job *find_job_by_pid(Scheduler *sched, pid_t pid)
+{
+    if (!sched || pid <= 0) {
+        return NULL;
+    }
+    for (int i = 0; i < sched->job_count; i++) {
+        if (sched->jobs[i].pid == pid) {
+            return &sched->jobs[i];
+        }
+    }
+    return NULL;
+}
+
+static Worker *find_worker_by_pid(Scheduler *sched, pid_t pid)
+{
+    if (!sched || pid <= 0) {
+        return NULL;
+    }
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (sched->workers[i].pid == pid) {
+            return &sched->workers[i];
+        }
+    }
+    return NULL;
+}
+
+static Worker *find_worker_by_job_id(Scheduler *sched, int job_id)
+{
+    if (!sched || job_id <= 0) {
+        return NULL;
+    }
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (sched->workers[i].current_job_id == job_id) {
+            return &sched->workers[i];
+        }
+    }
+    return NULL;
+}
+
+static void format_timestamp(time_t t, char *buf, size_t size)
+{
+    if (t <= 0) {
+        snprintf(buf, size, "N/A");
+        return;
+    }
+    struct tm *tm_info = localtime(&t);
+    if (tm_info) {
+        strftime(buf, size, "%Y-%m-%d %H:%M:%S", tm_info);
+    } else {
+        snprintf(buf, size, "N/A");
+    }
+}
+
+/* =========================================================================
+ * SYSTEM V SHARED MEMORY & SEMAPHORE SYNCHRONIZATION (Phases 12 & 13)
+ * ========================================================================= */
+
 void scheduler_sync_shm(Scheduler *sched)
 {
-    if (!sched || !sched->shm) return;
+    if (!sched || !sched->shm) {
+        return;
+    }
 
-    /* P() Operation: Acquire Binary Semaphore Lock before entering Critical Section */
+    /* P() Lock: Acquire binary semaphore before entering Critical Section */
     ipc_sem_lock(sched->semid);
 
-    /* --- CRITICAL SECTION START --- */
     sched->shm->total_jobs = sched->job_count;
     sched->shm->active_workers = sched->active_workers;
 
@@ -30,11 +105,20 @@ void scheduler_sync_shm(Scheduler *sched)
     for (int i = 0; i < sched->job_count; i++) {
         sched->shm->jobs[i] = sched->jobs[i];
         switch (sched->jobs[i].state) {
-            case JOB_STATE_RUNNING:   running++; break;
-            case JOB_STATE_COMPLETED: completed++; break;
-            case JOB_STATE_FAILED:    failed++; break;
-            case JOB_STATE_CANCELLED: cancelled++; break;
-            default: break;
+            case JOB_STATE_RUNNING:
+                running++;
+                break;
+            case JOB_STATE_COMPLETED:
+                completed++;
+                break;
+            case JOB_STATE_FAILED:
+                failed++;
+                break;
+            case JOB_STATE_CANCELLED:
+                cancelled++;
+                break;
+            default:
+                break;
         }
     }
 
@@ -42,15 +126,17 @@ void scheduler_sync_shm(Scheduler *sched)
     sched->shm->completed_jobs = completed;
     sched->shm->failed_jobs = failed;
     sched->shm->cancelled_jobs = cancelled;
-    /* --- CRITICAL SECTION END --- */
 
-    /* V() Operation: Release Binary Semaphore Lock */
+    /* V() Unlock: Release binary semaphore */
     ipc_sem_unlock(sched->semid);
 }
 
 void scheduler_init(Scheduler *sched)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
+
     sched->job_count = 0;
     sched->next_job_id = 1;
     sched->active_workers = 0;
@@ -64,7 +150,6 @@ void scheduler_init(Scheduler *sched)
 
     signals_init();
 
-    /* Initialize System V Shared Memory & Semaphore */
     key_t key = ipc_get_key("/tmp", 'S');
     if (key != -1) {
         if (ipc_shm_create(key, sizeof(SharedSchedulerState), &sched->shmid) == 0) {
@@ -87,7 +172,9 @@ void scheduler_init(Scheduler *sched)
 
 void scheduler_cleanup(Scheduler *sched)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
 
     if (sched->shm) {
         ipc_shm_detach(sched->shm);
@@ -107,14 +194,115 @@ void scheduler_cleanup(Scheduler *sched)
     }
 }
 
+/* =========================================================================
+ * PHASE 16: ROBUST SCHEDULER SHUTDOWN
+ * ========================================================================= */
+
+void scheduler_shutdown(Scheduler *sched)
+{
+    if (!sched) {
+        return;
+    }
+
+    printf("\n[SHUTDOWN] ============ Graceful Shutdown Initiated ============\n");
+
+    /* Step 1 & 2: Resume stopped workers, then send SIGTERM */
+    int has_running = 0;
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        Worker *w = &sched->workers[i];
+        if (!w->active || w->pid <= 0) {
+            continue;
+        }
+
+        has_running = 1;
+        Job *j = find_job(sched, w->current_job_id);
+
+        if (j && j->state == JOB_STATE_STOPPED) {
+            printf("[SHUTDOWN] Step 1: Resuming stopped Job ID %d (PID %d) before SIGTERM.\n",
+                   j->job_id, w->pid);
+            kill(w->pid, SIGCONT);
+        }
+
+        printf("[SHUTDOWN] Step 2: Sending SIGTERM to Worker Slot %d (PID %d, Job ID %d).\n",
+               w->worker_id + 1, w->pid, w->current_job_id);
+        kill(w->pid, SIGTERM);
+    }
+
+    /* Step 3: Grace period (500ms) for workers to exit */
+    if (has_running) {
+        printf("[SHUTDOWN] Step 3: Grace period (500ms) for workers to handle SIGTERM...\n");
+        usleep(500000);
+    }
+
+    /* Step 4: SIGKILL any workers that are still alive */
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        Worker *w = &sched->workers[i];
+        if (w->active && w->pid > 0 && kill(w->pid, 0) == 0) {
+            printf("[SHUTDOWN] Step 4: Worker Slot %d (PID %d) still alive — sending SIGKILL.\n",
+                   w->worker_id + 1, w->pid);
+            kill(w->pid, SIGKILL);
+        }
+    }
+
+    /* Step 5: Reap all worker children */
+    printf("[SHUTDOWN] Step 5: Reaping all worker children...\n");
+    int status;
+    pid_t wpid;
+    while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
+        Job *j = find_job_by_pid(sched, wpid);
+        if (j && j->state != JOB_STATE_CANCELLED) {
+            process_evaluate_exit_status(j, status);
+            printf("[SHUTDOWN]   Reaped PID %d -> Job ID %d -> %s\n",
+                   wpid, j->job_id, job_state_to_string(j->state));
+        }
+    }
+
+    /* Mark any unfinished jobs as CANCELLED at shutdown */
+    for (int i = 0; i < sched->job_count; i++) {
+        Job *j = &sched->jobs[i];
+        if (j->state == JOB_STATE_WAITING || j->state == JOB_STATE_RUNNING || j->state == JOB_STATE_STOPPED) {
+            j->state = JOB_STATE_CANCELLED;
+            j->completed_at = time(NULL);
+            printf("[SHUTDOWN]   Job ID %d ('%s') -> CANCELLED (not yet completed at shutdown).\n",
+                   j->job_id, j->full_command);
+        }
+    }
+
+    /* Step 6: Close all open pipe file descriptors */
+    printf("[SHUTDOWN] Step 6: Closing all worker pipe file descriptors...\n");
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        Worker *w = &sched->workers[i];
+        if (w->pipe_read_fd >= 0) {
+            close(w->pipe_read_fd);
+            w->pipe_read_fd = -1;
+            printf("[SHUTDOWN]   Worker Slot %d pipe FD closed.\n", w->worker_id + 1);
+        }
+        w->active = 0;
+        w->pid = -1;
+        w->current_job_id = -1;
+    }
+    sched->active_workers = 0;
+
+    /* Step 7: Clean up System V IPC resources */
+    printf("[SHUTDOWN] Step 7: Cleaning up System V IPC resources...\n");
+    scheduler_cleanup(sched);
+
+    printf("[SHUTDOWN] ============ Shutdown Complete. All IPC Resources Released. ============\n\n");
+}
+
+/* =========================================================================
+ * PHASES 10, 11 & 15: PIPE MULTIPLEXING, SELECT & FAILURE REAPING
+ * ========================================================================= */
+
 void scheduler_reap_workers(Scheduler *sched)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
 
-    /* Clear pending SIGCHLD flag before harvesting */
     signals_clear_pending_chld();
 
-    /* Multiplex across worker pipes */
+    /* Build descriptor table for select() */
     int fds[MAX_WORKERS];
     int ready[MAX_WORKERS];
     int active_pipe_count = 0;
@@ -129,45 +317,32 @@ void scheduler_reap_workers(Scheduler *sched)
         }
     }
 
-    if (active_pipe_count > 0) {
-        int sel_ret = ipc_select_pipes(fds, MAX_WORKERS, ready, 10);
-        if (sel_ret > 0) {
-            for (int i = 0; i < MAX_WORKERS; i++) {
-                if (ready[i]) {
-                    Worker *w = &sched->workers[i];
-                    char pipe_buf[256];
-                    int bytes_read = ipc_read_message(w->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
-                    if (bytes_read > 0) {
-                        size_t len = strlen(pipe_buf);
-                        if (len > 0 && pipe_buf[len - 1] == '\n') pipe_buf[len - 1] = '\0';
-                        printf("[SELECT MULTIPLEXER] Worker Slot %d (PID %d, FD %d) readable -> %s\n",
-                               w->worker_id + 1, w->pid, w->pipe_read_fd, pipe_buf);
+    /* Multiplex across worker pipes using select() */
+    if (active_pipe_count > 0 && ipc_select_pipes(fds, MAX_WORKERS, ready, 10) > 0) {
+        for (int i = 0; i < MAX_WORKERS; i++) {
+            if (ready[i]) {
+                Worker *w = &sched->workers[i];
+                char pipe_buf[256];
+                int bytes_read = ipc_read_message(w->pipe_read_fd, pipe_buf, sizeof(pipe_buf));
+                if (bytes_read > 0) {
+                    size_t len = strlen(pipe_buf);
+                    if (len > 0 && pipe_buf[len - 1] == '\n') {
+                        pipe_buf[len - 1] = '\0';
                     }
+                    printf("[SELECT MULTIPLEXER] Worker Slot %d (PID %d, FD %d) readable -> %s\n",
+                           w->worker_id + 1, w->pid, w->pipe_read_fd, pipe_buf);
                 }
             }
         }
     }
 
+    /* Harvest child process status using waitpid() */
     int status = 0;
     pid_t wpid;
 
-    /* Non-blocking waitpid harvesting loop */
     while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
-        Job *j = NULL;
-        for (int i = 0; i < sched->job_count; i++) {
-            if (sched->jobs[i].pid == wpid) {
-                j = &sched->jobs[i];
-                break;
-            }
-        }
-
-        Worker *w = NULL;
-        for (int i = 0; i < MAX_WORKERS; i++) {
-            if (sched->workers[i].pid == wpid) {
-                w = &sched->workers[i];
-                break;
-            }
-        }
+        Job *j = find_job_by_pid(sched, wpid);
+        Worker *w = find_worker_by_pid(sched, wpid);
 
         if (j && j->state != JOB_STATE_CANCELLED) {
             process_evaluate_exit_status(j, status);
@@ -176,12 +351,10 @@ void scheduler_reap_workers(Scheduler *sched)
         int worker_slot = -1;
         if (w) {
             worker_slot = w->worker_id + 1;
-
             if (w->pipe_read_fd >= 0) {
                 close(w->pipe_read_fd);
                 w->pipe_read_fd = -1;
             }
-
             w->active = 0;
             w->current_job_id = -1;
             w->pid = -1;
@@ -191,72 +364,46 @@ void scheduler_reap_workers(Scheduler *sched)
         }
 
         if (j && j->state != JOB_STATE_CANCELLED) {
-            /*
-             * PHASE 15: Worker Failure Detection
-             *
-             * How the scheduler detects a worker failure:
-             *   1. Worker process exits (normally or killed by signal).
-             *   2. Kernel sends SIGCHLD to scheduler (parent) process.
-             *   3. SIGCHLD handler sets a volatile sig_atomic_t flag.
-             *   4. Main scheduler loop calls scheduler_reap_workers().
-             *   5. waitpid(-1, &status, WNOHANG) harvests the exit status.
-             *   6. WIFSIGNALED(status) == true  => killed by signal (crash).
-             *      WIFEXITED(status)   == true  => normal exit.
-             *      WEXITSTATUS(status) != 0     => non-zero exit (failure).
-             */
             if (WIFSIGNALED(status)) {
                 int sig = WTERMSIG(status);
                 printf("\n[WORKER_CRASHED] Worker Slot %d (PID %d) was KILLED by signal %d (%s)\n",
-                       worker_slot > 0 ? worker_slot : 0,
-                       wpid,
-                       sig,
-                       strsignal(sig));
+                       worker_slot > 0 ? worker_slot : 0, wpid, sig, strsignal(sig));
                 printf("[WORKER_CRASHED] Job ID %d ('%s') -> Marked FAILED | Exit Code: %d\n",
                        j->job_id, j->full_command, j->exit_code);
                 printf("[WORKER_CRASHED] Scheduler is still RUNNING. Worker slot %d is now FREE.\n\n",
                        worker_slot > 0 ? worker_slot : 0);
             } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
                 printf("\n[SIGCHLD REAPER] Worker Slot %d (PID %d) -> Job ID %d ('%s') exited with non-zero code %d -> FAILED (Duration: %.2fs)\n",
-                       worker_slot > 0 ? worker_slot : 0,
-                       wpid,
-                       j->job_id,
-                       j->full_command,
-                       j->exit_code,
-                       j->duration);
+                       worker_slot > 0 ? worker_slot : 0, wpid, j->job_id, j->full_command, j->exit_code, j->duration);
             } else {
                 printf("\n[SIGCHLD REAPER] Worker Slot %d (PID %d) finished Job ID %d ('%s') -> State: %s (Exit Code: %d, Duration: %.2fs)\n",
-                       worker_slot > 0 ? worker_slot : 0,
-                       wpid,
-                       j->job_id,
-                       j->full_command,
-                       job_state_to_string(j->state),
-                       j->exit_code,
-                       j->duration);
+                       worker_slot > 0 ? worker_slot : 0, wpid, j->job_id, j->full_command, job_state_to_string(j->state), j->exit_code, j->duration);
             }
         }
     }
 
-    /* Synchronize shared memory state */
     scheduler_sync_shm(sched);
 }
 
+/* =========================================================================
+ * PHASE 6: CORE DISPATCHER & PRIORITY QUEUE SCHEDULING
+ * ========================================================================= */
+
 void scheduler_dispatch(Scheduler *sched)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
 
-    /* Reap finished workers */
     scheduler_reap_workers(sched);
 
-    /* Fill available worker slots with highest-priority WAITING jobs */
     while (sched->active_workers < MAX_WORKERS) {
         Job *best_job = NULL;
+
         for (int i = 0; i < sched->job_count; i++) {
             if (sched->jobs[i].state == JOB_STATE_WAITING) {
-                if (best_job == NULL) {
-                    best_job = &sched->jobs[i];
-                } else if (sched->jobs[i].priority < best_job->priority) {
-                    best_job = &sched->jobs[i];
-                } else if (sched->jobs[i].priority == best_job->priority && sched->jobs[i].job_id < best_job->job_id) {
+                if (!best_job || sched->jobs[i].priority < best_job->priority ||
+                   (sched->jobs[i].priority == best_job->priority && sched->jobs[i].job_id < best_job->job_id)) {
                     best_job = &sched->jobs[i];
                 }
             }
@@ -289,18 +436,16 @@ void scheduler_dispatch(Scheduler *sched)
             sched->active_workers++;
 
             printf("[SCHEDULER] Dispatched Job ID %d ('%s', Priority %d) -> Worker Slot %d (PID %d, Pipe FD %d)\n",
-                   best_job->job_id,
-                   best_job->full_command,
-                   best_job->priority,
-                   free_worker->worker_id + 1,
-                   pid,
-                   free_worker->pipe_read_fd);
+                   best_job->job_id, best_job->full_command, best_job->priority, free_worker->worker_id + 1, pid, free_worker->pipe_read_fd);
         }
     }
 
-    /* Synchronize shared memory state */
     scheduler_sync_shm(sched);
 }
+
+/* =========================================================================
+ * JOB SUBMISSION, CANCELLATION, PAUSE & RESUME
+ * ========================================================================= */
 
 int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority)
 {
@@ -361,32 +506,21 @@ int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority)
 
 int scheduler_cancel_job(Scheduler *sched, int job_id)
 {
-    if (!sched) return -1;
-
-    Job *target = NULL;
-    for (int i = 0; i < sched->job_count; i++) {
-        if (sched->jobs[i].job_id == job_id) {
-            target = &sched->jobs[i];
-            break;
-        }
-    }
-
+    Job *target = find_job(sched, job_id);
     if (!target) {
         printf("\nError: Job ID %d not found.\n\n", job_id);
         return -1;
     }
 
     if (target->state == JOB_STATE_COMPLETED || target->state == JOB_STATE_FAILED || target->state == JOB_STATE_CANCELLED) {
-        printf("\nError: Cannot cancel Job ID %d (Current state: %s).\n\n",
-               job_id, job_state_to_string(target->state));
+        printf("\nError: Cannot cancel Job ID %d (Current state: %s).\n\n", job_id, job_state_to_string(target->state));
         return -1;
     }
 
     if (target->state == JOB_STATE_WAITING) {
         target->state = JOB_STATE_CANCELLED;
         target->completed_at = time(NULL);
-        printf("\n[SCHEDULER] Job ID %d ('%s') cancelled from waiting queue.\n\n",
-               job_id, target->full_command);
+        printf("\n[SCHEDULER] Job ID %d ('%s') cancelled from waiting queue.\n\n", job_id, target->full_command);
         scheduler_sync_shm(sched);
         return 0;
     }
@@ -409,22 +543,21 @@ int scheduler_cancel_job(Scheduler *sched, int job_id)
             target->duration = difftime(target->completed_at, target->started_at);
         }
 
-        for (int k = 0; k < MAX_WORKERS; k++) {
-            if (sched->workers[k].current_job_id == job_id) {
-                if (sched->workers[k].pipe_read_fd >= 0) {
-                    close(sched->workers[k].pipe_read_fd);
-                    sched->workers[k].pipe_read_fd = -1;
-                }
-                sched->workers[k].active = 0;
-                sched->workers[k].current_job_id = -1;
-                sched->workers[k].pid = -1;
-                if (sched->active_workers > 0) sched->active_workers--;
-                break;
+        Worker *w = find_worker_by_job_id(sched, job_id);
+        if (w) {
+            if (w->pipe_read_fd >= 0) {
+                close(w->pipe_read_fd);
+                w->pipe_read_fd = -1;
+            }
+            w->active = 0;
+            w->current_job_id = -1;
+            w->pid = -1;
+            if (sched->active_workers > 0) {
+                sched->active_workers--;
             }
         }
 
         printf("\n[SCHEDULER] Job ID %d (PID %d) cancelled via SIGTERM.\n\n", job_id, target->pid);
-
         scheduler_dispatch(sched);
         return 0;
     }
@@ -434,16 +567,7 @@ int scheduler_cancel_job(Scheduler *sched, int job_id)
 
 int scheduler_pause_job(Scheduler *sched, int job_id)
 {
-    if (!sched) return -1;
-
-    Job *target = NULL;
-    for (int i = 0; i < sched->job_count; i++) {
-        if (sched->jobs[i].job_id == job_id) {
-            target = &sched->jobs[i];
-            break;
-        }
-    }
-
+    Job *target = find_job(sched, job_id);
     if (!target) {
         printf("\nError: Job ID %d not found.\n\n", job_id);
         return -1;
@@ -455,16 +579,11 @@ int scheduler_pause_job(Scheduler *sched, int job_id)
         return -1;
     }
 
-    if (target->pid > 0) {
-        if (signals_send(target->pid, SIGSTOP) == 0) {
-            target->state = JOB_STATE_STOPPED;
-            printf("\n[SCHEDULER] Job ID %d (PID %d) paused (SIGSTOP sent).\n\n", job_id, target->pid);
-            scheduler_sync_shm(sched);
-            return 0;
-        } else {
-            perror("Failed to send SIGSTOP");
-            return -1;
-        }
+    if (target->pid > 0 && signals_send(target->pid, SIGSTOP) == 0) {
+        target->state = JOB_STATE_STOPPED;
+        printf("\n[SCHEDULER] Job ID %d (PID %d) paused (SIGSTOP sent).\n\n", job_id, target->pid);
+        scheduler_sync_shm(sched);
+        return 0;
     }
 
     return -1;
@@ -472,16 +591,7 @@ int scheduler_pause_job(Scheduler *sched, int job_id)
 
 int scheduler_resume_job(Scheduler *sched, int job_id)
 {
-    if (!sched) return -1;
-
-    Job *target = NULL;
-    for (int i = 0; i < sched->job_count; i++) {
-        if (sched->jobs[i].job_id == job_id) {
-            target = &sched->jobs[i];
-            break;
-        }
-    }
-
+    Job *target = find_job(sched, job_id);
     if (!target) {
         printf("\nError: Job ID %d not found.\n\n", job_id);
         return -1;
@@ -493,16 +603,11 @@ int scheduler_resume_job(Scheduler *sched, int job_id)
         return -1;
     }
 
-    if (target->pid > 0) {
-        if (signals_send(target->pid, SIGCONT) == 0) {
-            target->state = JOB_STATE_RUNNING;
-            printf("\n[SCHEDULER] Job ID %d (PID %d) resumed (SIGCONT sent).\n\n", job_id, target->pid);
-            scheduler_sync_shm(sched);
-            return 0;
-        } else {
-            perror("Failed to send SIGCONT");
-            return -1;
-        }
+    if (target->pid > 0 && signals_send(target->pid, SIGCONT) == 0) {
+        target->state = JOB_STATE_RUNNING;
+        printf("\n[SCHEDULER] Job ID %d (PID %d) resumed (SIGCONT sent).\n\n", job_id, target->pid);
+        scheduler_sync_shm(sched);
+        return 0;
     }
 
     return -1;
@@ -510,33 +615,38 @@ int scheduler_resume_job(Scheduler *sched, int job_id)
 
 void scheduler_wait_all(Scheduler *sched)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
 
     printf("\n[SCHEDULER] Waiting for all running and queued jobs to complete...\n");
-
     while (1) {
         scheduler_dispatch(sched);
-
         int pending = 0;
         for (int i = 0; i < sched->job_count; i++) {
-            if (sched->jobs[i].state == JOB_STATE_WAITING || sched->jobs[i].state == JOB_STATE_RUNNING || sched->jobs[i].state == JOB_STATE_STOPPED) {
+            if (sched->jobs[i].state == JOB_STATE_WAITING ||
+                sched->jobs[i].state == JOB_STATE_RUNNING ||
+                sched->jobs[i].state == JOB_STATE_STOPPED) {
                 pending++;
             }
         }
-
         if (pending == 0 && sched->active_workers == 0) {
             break;
         }
-
         usleep(50000);
     }
-
     printf("[SCHEDULER] All jobs have completed execution.\n\n");
 }
 
+/* =========================================================================
+ * CLI DISPLAY AND QUERY COMMANDS
+ * ========================================================================= */
+
 void scheduler_list_jobs(const Scheduler *sched)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
 
     scheduler_reap_workers((Scheduler *)sched);
 
@@ -550,22 +660,19 @@ void scheduler_list_jobs(const Scheduler *sched)
 
     for (int i = 0; i < sched->job_count; i++) {
         const Job *j = &sched->jobs[i];
-        char pid_str[16];
+        char pid_str[16], worker_str[16] = "-", dur_str[32];
+
         if (j->pid <= 0) {
             snprintf(pid_str, sizeof(pid_str), "-");
         } else {
             snprintf(pid_str, sizeof(pid_str), "%d", j->pid);
         }
 
-        char worker_str[16] = "-";
-        for (int k = 0; k < MAX_WORKERS; k++) {
-            if (sched->workers[k].current_job_id == j->job_id) {
-                snprintf(worker_str, sizeof(worker_str), "W%d", sched->workers[k].worker_id + 1);
-                break;
-            }
+        Worker *w = find_worker_by_job_id((Scheduler *)sched, j->job_id);
+        if (w) {
+            snprintf(worker_str, sizeof(worker_str), "W%d", w->worker_id + 1);
         }
 
-        char dur_str[32];
         if (j->state == JOB_STATE_COMPLETED || j->state == JOB_STATE_FAILED || j->state == JOB_STATE_CANCELLED) {
             snprintf(dur_str, sizeof(dur_str), "%.2fs", j->duration);
         } else {
@@ -573,78 +680,46 @@ void scheduler_list_jobs(const Scheduler *sched)
         }
 
         printf("%-5d %-6s %-11d %-11s %-9s %-10s\n",
-               j->job_id,
-               pid_str,
-               j->priority,
-               job_state_to_string(j->state),
-               worker_str,
-               dur_str);
+               j->job_id, pid_str, j->priority, job_state_to_string(j->state), worker_str, dur_str);
     }
 
     if (sched->shm) {
         ipc_sem_lock(sched->semid);
         printf("\n[SYSTEM V SHM + SEM TELEMETRY] Total: %d | Running: %d | Completed: %d | Failed: %d | Cancelled: %d\n",
-               sched->shm->total_jobs,
-               sched->shm->running_jobs,
-               sched->shm->completed_jobs,
-               sched->shm->failed_jobs,
-               sched->shm->cancelled_jobs);
+               sched->shm->total_jobs, sched->shm->running_jobs, sched->shm->completed_jobs, sched->shm->failed_jobs, sched->shm->cancelled_jobs);
         ipc_sem_unlock(sched->semid);
     }
     printf("\n");
 }
 
-static void format_timestamp(time_t t, char *buf, size_t size)
-{
-    if (t <= 0) {
-        snprintf(buf, size, "N/A");
-        return;
-    }
-    struct tm *tm_info = localtime(&t);
-    if (tm_info) {
-        strftime(buf, size, "%Y-%m-%d %H:%M:%S", tm_info);
-    } else {
-        snprintf(buf, size, "N/A");
-    }
-}
-
 void scheduler_job_status(const Scheduler *sched, int job_id)
 {
-    if (!sched) return;
+    if (!sched) {
+        return;
+    }
 
     scheduler_reap_workers((Scheduler *)sched);
 
-    const Job *found = NULL;
-    for (int i = 0; i < sched->job_count; i++) {
-        if (sched->jobs[i].job_id == job_id) {
-            found = &sched->jobs[i];
-            break;
-        }
-    }
-
+    const Job *found = find_job((Scheduler *)sched, job_id);
     if (!found) {
         printf("\nError: Job ID %d not found.\n\n", job_id);
         return;
     }
 
-    char created_str[64], started_str[64], completed_str[64];
+    char created_str[64], started_str[64], completed_str[64], pid_str[16], worker_str[32] = "-";
     format_timestamp(found->created_at, created_str, sizeof(created_str));
     format_timestamp(found->started_at, started_str, sizeof(started_str));
     format_timestamp(found->completed_at, completed_str, sizeof(completed_str));
 
-    char pid_str[16];
     if (found->pid <= 0) {
         snprintf(pid_str, sizeof(pid_str), "-");
     } else {
         snprintf(pid_str, sizeof(pid_str), "%d", found->pid);
     }
 
-    char worker_str[32] = "-";
-    for (int k = 0; k < MAX_WORKERS; k++) {
-        if (sched->workers[k].current_job_id == found->job_id) {
-            snprintf(worker_str, sizeof(worker_str), "Worker Slot %d", sched->workers[k].worker_id + 1);
-            break;
-        }
+    Worker *w = find_worker_by_job_id((Scheduler *)sched, found->job_id);
+    if (w) {
+        snprintf(worker_str, sizeof(worker_str), "Worker Slot %d", w->worker_id + 1);
     }
 
     printf("\nJob Details:\n");

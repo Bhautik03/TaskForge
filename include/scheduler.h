@@ -18,6 +18,22 @@ typedef struct {
 
 void scheduler_init(Scheduler *sched);
 void scheduler_cleanup(Scheduler *sched);
+
+/*
+ * Phase 16: Robust Shutdown Sequence
+ *
+ * Performs ordered teardown:
+ *   1. Stop accepting new jobs (caller responsibility: exit main loop)
+ *   2. Send SIGTERM to all running workers (grace period)
+ *   3. Wait for workers to exit (blocking waitpid with timeout)
+ *   4. Send SIGKILL to any remaining workers
+ *   5. Reap all children (waitpid loop)
+ *   6. Close all open pipe file descriptors
+ *   7. Detach shared memory region
+ *   8. Remove (destroy) shared memory segment (IPC_RMID)
+ *   9. Remove semaphore set (IPC_RMID)
+ */
+void scheduler_shutdown(Scheduler *sched);
 void scheduler_sync_shm(Scheduler *sched);
 int scheduler_submit_job(Scheduler *sched, const char *raw_cmd, int priority);
 void scheduler_dispatch(Scheduler *sched);

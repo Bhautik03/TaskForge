@@ -1,9 +1,12 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include "common.h"
 #include "scheduler.h"
+#include "signals.h"
 
 static void trim_whitespace(char *str)
 {
@@ -92,7 +95,7 @@ static void print_help(void)
     printf("  cancel <job_id>              Cancel a job (sends SIGTERM)\n");
     printf("  wait                         Wait for all running and queued jobs to complete\n");
     printf("  help                         Display this help menu\n");
-    printf("  exit                         Exit the scheduler program\n\n");
+    printf("  exit                         Gracefully shut down the scheduler\n\n");
 }
 
 int main(void)
@@ -103,12 +106,23 @@ int main(void)
     char line[MAX_COMMAND_LEN * 2];
 
     printf("=========================================================\n");
-    printf(" Multi-Process Job Scheduler (Phase 12: Shared Memory)  \n");
+    printf(" Multi-Process Job Scheduler (Phase 16: Robust Shutdown) \n");
     printf(" Priority: 1 = Highest, 10 = Lowest                     \n");
-    printf(" Type 'help' for available commands or 'exit' to quit.   \n");
+    printf(" Ctrl+C or 'exit' for graceful shutdown.                 \n");
     printf("=========================================================\n\n");
 
     while (1) {
+        /*
+         * Phase 16: Check shutdown flag before every iteration.
+         * g_shutdown_requested is set by the SIGINT/SIGTERM handler.
+         * Since SA_RESTART is NOT set, fgets() returns NULL with
+         * errno == EINTR when interrupted, which also leads here.
+         */
+        if (g_shutdown_requested) {
+            printf("\n[SHUTDOWN] Signal received (SIGINT/SIGTERM). Initiating graceful shutdown...\n");
+            break;
+        }
+
         /* Periodically harvest finished workers and dispatch waiting jobs */
         scheduler_dispatch(&sched);
 
@@ -116,7 +130,17 @@ int main(void)
         fflush(stdout);
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
-            printf("\nExiting scheduler.\n");
+            /*
+             * fgets returns NULL on:
+             *   (a) EOF (Ctrl+D / end of pipe input)
+             *   (b) EINTR (interrupted by SIGINT/SIGTERM)
+             * In both cases, run the shutdown sequence.
+             */
+            if (g_shutdown_requested) {
+                printf("\n[SHUTDOWN] Signal received. Initiating graceful shutdown...\n");
+            } else {
+                printf("\nEOF detected. Initiating graceful shutdown...\n");
+            }
             break;
         }
 
@@ -182,13 +206,14 @@ int main(void)
         } else if (strcmp(command, "help") == 0) {
             print_help();
         } else if (strcmp(command, "exit") == 0) {
-            printf("Exiting scheduler.\n");
+            printf("[SHUTDOWN] 'exit' command received.\n");
             break;
         } else {
             printf("Unknown command '%s'. Type 'help' for available commands.\n\n", command);
         }
     }
 
-    scheduler_cleanup(&sched);
+    /* Phase 16: Always use scheduler_shutdown() for ordered cleanup */
+    scheduler_shutdown(&sched);
     return 0;
 }
