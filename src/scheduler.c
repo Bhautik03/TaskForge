@@ -78,7 +78,7 @@ void scheduler_init(Scheduler *sched)
         }
 
         if (ipc_sem_create(key, &sched->semid) == 0) {
-            ipc_sem_init(sched->semid, 1); /* Initialize binary semaphore to 1 */
+            ipc_sem_init(sched->semid, 1);
             printf("[SYSTEM V SEMAPHORE] Binary Semaphore Initialized (SEMID: %d, Key: 0x%x, Value: 1)\n\n",
                    sched->semid, key);
         }
@@ -177,12 +177,6 @@ void scheduler_reap_workers(Scheduler *sched)
         if (w) {
             worker_slot = w->worker_id + 1;
 
-            if (j) {
-                const char *st_msg = (j->state == JOB_STATE_COMPLETED) ? "COMPLETED" : "FAILED";
-                printf("[SELECT MULTIPLEXER] Worker Slot %d (PID %d) -> JOB %d %s\n",
-                       worker_slot, wpid, j->job_id, st_msg);
-            }
-
             if (w->pipe_read_fd >= 0) {
                 close(w->pipe_read_fd);
                 w->pipe_read_fd = -1;
@@ -197,18 +191,52 @@ void scheduler_reap_workers(Scheduler *sched)
         }
 
         if (j && j->state != JOB_STATE_CANCELLED) {
-            printf("\n[SIGCHLD REAPER] Worker Slot %d (PID %d) finished Job ID %d ('%s') -> State: %s (Exit Code: %d, Duration: %.2fs)\n",
-                   worker_slot > 0 ? worker_slot : 0,
-                   wpid,
-                   j->job_id,
-                   j->full_command,
-                   job_state_to_string(j->state),
-                   j->exit_code,
-                   j->duration);
+            /*
+             * PHASE 15: Worker Failure Detection
+             *
+             * How the scheduler detects a worker failure:
+             *   1. Worker process exits (normally or killed by signal).
+             *   2. Kernel sends SIGCHLD to scheduler (parent) process.
+             *   3. SIGCHLD handler sets a volatile sig_atomic_t flag.
+             *   4. Main scheduler loop calls scheduler_reap_workers().
+             *   5. waitpid(-1, &status, WNOHANG) harvests the exit status.
+             *   6. WIFSIGNALED(status) == true  => killed by signal (crash).
+             *      WIFEXITED(status)   == true  => normal exit.
+             *      WEXITSTATUS(status) != 0     => non-zero exit (failure).
+             */
+            if (WIFSIGNALED(status)) {
+                int sig = WTERMSIG(status);
+                printf("\n[WORKER_CRASHED] Worker Slot %d (PID %d) was KILLED by signal %d (%s)\n",
+                       worker_slot > 0 ? worker_slot : 0,
+                       wpid,
+                       sig,
+                       strsignal(sig));
+                printf("[WORKER_CRASHED] Job ID %d ('%s') -> Marked FAILED | Exit Code: %d\n",
+                       j->job_id, j->full_command, j->exit_code);
+                printf("[WORKER_CRASHED] Scheduler is still RUNNING. Worker slot %d is now FREE.\n\n",
+                       worker_slot > 0 ? worker_slot : 0);
+            } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+                printf("\n[SIGCHLD REAPER] Worker Slot %d (PID %d) -> Job ID %d ('%s') exited with non-zero code %d -> FAILED (Duration: %.2fs)\n",
+                       worker_slot > 0 ? worker_slot : 0,
+                       wpid,
+                       j->job_id,
+                       j->full_command,
+                       j->exit_code,
+                       j->duration);
+            } else {
+                printf("\n[SIGCHLD REAPER] Worker Slot %d (PID %d) finished Job ID %d ('%s') -> State: %s (Exit Code: %d, Duration: %.2fs)\n",
+                       worker_slot > 0 ? worker_slot : 0,
+                       wpid,
+                       j->job_id,
+                       j->full_command,
+                       job_state_to_string(j->state),
+                       j->exit_code,
+                       j->duration);
+            }
         }
     }
 
-    /* Synchronize shared memory state safely inside critical section */
+    /* Synchronize shared memory state */
     scheduler_sync_shm(sched);
 }
 
@@ -270,7 +298,7 @@ void scheduler_dispatch(Scheduler *sched)
         }
     }
 
-    /* Synchronize shared memory state safely inside critical section */
+    /* Synchronize shared memory state */
     scheduler_sync_shm(sched);
 }
 
@@ -554,7 +582,6 @@ void scheduler_list_jobs(const Scheduler *sched)
     }
 
     if (sched->shm) {
-        /* Safely read SHM metrics under semaphore protection */
         ipc_sem_lock(sched->semid);
         printf("\n[SYSTEM V SHM + SEM TELEMETRY] Total: %d | Running: %d | Completed: %d | Failed: %d | Cancelled: %d\n",
                sched->shm->total_jobs,
